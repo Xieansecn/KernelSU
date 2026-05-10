@@ -48,10 +48,13 @@ jobs:
         working-directory: ${{ github.workspace }}/common-android15-6.6/common
         run: |
             curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s main
+
             sed -i '1i #define X86_FEATURE_INDIRECT_SAFE 1' drivers/kernelsu/core/init.c
+            sed -i '1i #include <linux/bug.h>' drivers/kernelsu/hook/x86_64/patch_memory.c
+            sed -i '1i #pragma clang diagnostic ignored "-Warray-bounds"' drivers/kernelsu/hook/x86_64/patch_memory.c
 
             git add -A
-            git commit -am "Add KernelSU"
+            git commit -m "Add KernelSU with x86_64 compile fixes"
 
       - name: Total kernel usage
         working-directory: ${{ github.workspace }}/common-android15-6.6
