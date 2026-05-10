@@ -71,5 +71,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ranchu-x86_64-kernel
-          path: ${{ github.workspace }}/common-android15-6.6/virt/bzImage
+          path: ${{ github.workspace }}/common-android15-6.6/virt/
 
