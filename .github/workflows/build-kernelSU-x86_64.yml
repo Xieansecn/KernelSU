@@ -53,21 +53,6 @@ jobs:
             git add -A
             git commit -am "Add KernelSU"
 
-            
-
-      - name: Enable kernelSU value
-        working-directory: ${{ github.workspace }}/common-android15-6.6
-        run: |
-            if [ -f common-modules/virtual-device/virtual_device_x86_64.fragment ]; then
-                echo '文件存在! 写入到: common-modules/virtual-device/virtual_device_x86_64.fragment 下!'
-                echo "CONFIG_KSU=y" >> common-modules/virtual-device/virtual_device_x86_64.fragment
-            else
-                echo '文件不存在! CONFIG_KSU 值写入到 common/arch/x86/configs/gki_defconfig'
-                echo "CONFIG_KSU=y" >> common/arch/x86/configs/gki_defconfig
-            fi
-            
-
-
       - name: Total kernel usage
         working-directory: ${{ github.workspace }}/common-android15-6.6
         run: |
