@@ -36,40 +36,38 @@ jobs:
             repo init -m manifest_13070261.xml
             repo sync -c --no-tags --no-clone-bundle -j$(nproc)
 
-      - name: Calculate KSU version
-        working-directory: ${{ github.workspace }}/common-android15-6.6
-        run: |
-            git clone --depth=1 https://github.com/tiann/KernelSU.git
-            cd KernelSU
-            KSU_VER=$(($(git rev-list --count HEAD) + 10200))
-            echo "KSU_VER=$KSU_VER" >> $GITHUB_ENV
-
       - name: Patch kernelSU
         working-directory: ${{ github.workspace }}/common-android15-6.6/common
         run: |
             curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s main
-
-            sed -i '1i #define X86_FEATURE_INDIRECT_SAFE 1' drivers/kernelsu/core/init.c
-            sed -i '1i #include <linux/bug.h>' drivers/kernelsu/hook/x86_64/patch_memory.c
-            sed -i '1i #pragma clang diagnostic ignored "-Warray-bounds"' drivers/kernelsu/hook/x86_64/patch_memory.c
-
+            git apply ${{ github.workspace }}/patchs/android15-6.6_x86_64.patch
             git add -A
-            git commit -m "Add KernelSU with x86_64 compile fixes"
+            git commit -m "Add x86_64 compile fixes for Android15-6.6 on kernel sources"
+            cd KernelSU
+            git apply ${{ github.workspace }}/patchs/kernelSU.patch
+            git add -A
+            git commit -m "Add x86_64 compile fixes for Android15-6.6 on KernelSU"
 
-      - name: Total kernel usage
+      - name: Total kernel usage before build
         working-directory: ${{ github.workspace }}/common-android15-6.6
         run: |
-            echo "Total disk usage:"
+            echo "Total disk usage before build:"
             du -sh .
 
       - name: Build kernel
         working-directory: ${{ github.workspace }}/common-android15-6.6
         run: |
-            tools/bazel run --config=fast --config=stamp --lto=none --action_env=KSU_VERSION=$KSU_VER //common-modules/virtual-device:virtual_device_x86_64_dist -- --dist_dir=virt
-    
+            tools/bazel run --config=fast --config=stamp --lto=none //common-modules/virtual-device:virtual_device_x86_64_dist -- --dist_dir=virt
+
+      - name: Total kernel usage after build
+        working-directory: ${{ github.workspace }}/common-android15-6.6
+        run: |
+            echo "Total disk usage after build:"
+            du -sh .
+
       - name: Upload Kernel Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ranchu-x86_64-kernel
-          path: ${{ github.workspace }}/common-android15-6.6/virt/
+          path: ${{ github.workspace }}/common-android15-6.6/virt/bzImage
 
