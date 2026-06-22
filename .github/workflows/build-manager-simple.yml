@@ -1,0 +1,188 @@
+name: Build Manager (initiative)
+
+on:
+  workflow_dispatch:
+    inputs:
+      SKIP_SIGN:
+        description: '主动跳过签名'
+        required: false
+        type: boolean
+        default: false
+      PR_BUILD:
+        description: '-PIS_PR_BUILD=true (dev)'
+        required: false
+        type: boolean
+        default: false
+      SIGN_TYPE:
+        description: '密钥库格式（JKS 或 PKCS12/Keystore）'
+        required: false
+        type: choice
+        default: 'jks'
+        options:
+          - jks
+          - pkcs12
+      KEYSTORE_BASE64:
+        description: 'Base64 编码的密钥库文件（未填写且未设置Secrets则不签名）'
+        required: false
+        type: string
+      KEY_ALIAS:
+        description: '密钥别名 (Alias)'
+        required: false
+        type: string
+      KEYSTORE_PASSWORD:
+        description: '密钥库密码'
+        required: false
+        type: string
+      KEY_PASSWORD:
+        description: '密钥密码'
+        required: false
+        type: string
+
+jobs:
+  build-manager:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./manager
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Write signing key
+        id: sign
+        continue-on-error: true
+        env:
+          SIGN_TYPE: ${{ inputs.SIGN_TYPE || 'jks' }}
+          KS_BASE64: ${{ inputs.KEYSTORE_BASE64 || secrets.KEYSTORE }}
+          KS_ALIAS: ${{ inputs.KEY_ALIAS || secrets.KEY_ALIAS }}
+          KS_STORE_PASS: ${{ inputs.KEYSTORE_PASSWORD || secrets.KEYSTORE_PASSWORD }}
+          KS_KEY_PASS: ${{ inputs.KEY_PASSWORD || secrets.KEY_PASSWORD }}
+        run: |
+          if [ "${{ inputs.SKIP_SIGN }}" = "true" ]; then
+            echo "SIGNED=false" >> $GITHUB_OUTPUT
+            echo "已勾选跳过签名，输出未签名 APK"
+            exit 0
+          fi
+
+          if [ -z "$KS_BASE64" ] || [ -z "$KS_ALIAS" ] || [ -z "$KS_STORE_PASS" ] || [ -z "$KS_KEY_PASS" ]; then
+            echo "SIGNED=false" >> $GITHUB_OUTPUT
+            echo "签名信息不完整（Base64/别名/密码有缺失），输出未签名 APK"
+            exit 0
+          fi
+
+          # 根据格式确定文件扩展名和 keytool storetype
+          if [ "$SIGN_TYPE" = "pkcs12" ]; then
+            KEY_FILE="key.keystore"
+            STORE_TYPE="pkcs12"
+          else
+            KEY_FILE="key.jks"
+            STORE_TYPE="jks"
+          fi
+
+          echo "$KS_BASE64" | base64 -d > "$KEY_FILE" || {
+            echo "SIGNED=false" >> $GITHUB_OUTPUT
+            echo "Base64 解码失败，输出未签名 APK"
+            exit 0
+          }
+
+          keytool -list -keystore "$KEY_FILE" -storetype "$STORE_TYPE" -storepass "$KS_STORE_PASS" -alias "$KS_ALIAS" > /dev/null 2>&1 || {
+            echo "SIGNED=false" >> $GITHUB_OUTPUT
+            echo "密钥库验证失败（别名或密码不正确，或格式不匹配），输出未签名 APK"
+            exit 0
+          }
+
+          {
+            echo KEYSTORE_PASSWORD="$KS_STORE_PASS"
+            echo KEY_ALIAS="$KS_ALIAS"
+            echo KEY_PASSWORD="$KS_KEY_PASS"
+            echo KEYSTORE_FILE="$KEY_FILE"
+          } >> gradle.properties
+
+          echo "SIGNED=true" >> $GITHUB_OUTPUT
+          echo "STORE_TYPE=$STORE_TYPE" >> $GITHUB_OUTPUT
+          echo "KEY_FILE=$KEY_FILE" >> $GITHUB_OUTPUT
+          echo "KEY_ALIAS=$KS_ALIAS" >> $GITHUB_OUTPUT
+          echo "KEY_STORE_PASS=$KS_STORE_PASS" >> $GITHUB_OUTPUT
+          echo "签名配置成功 ($SIGN_TYPE)"
+
+      - name: Extract custom cert hash
+        id: cert
+        if: ${{ steps.sign.outputs.SIGNED == 'true' }}
+        env:
+          STORE_TYPE: ${{ steps.sign.outputs.STORE_TYPE }}
+          KEY_FILE: ${{ steps.sign.outputs.KEY_FILE }}
+          KEY_ALIAS: ${{ steps.sign.outputs.KEY_ALIAS }}
+          KEY_STORE_PASS: ${{ steps.sign.outputs.KEY_STORE_PASS }}
+        run: |
+          OFFICIAL_SIZE=$(grep '^KSU_EXPECTED_SIZE :=' "$GITHUB_WORKSPACE/kernel/Kbuild" | awk '{print $3}')
+          OFFICIAL_HASH=$(grep '^KSU_EXPECTED_HASH :=' "$GITHUB_WORKSPACE/kernel/Kbuild" | awk '{print $3}')
+
+          keytool -exportcert \
+            -alias "$KEY_ALIAS" \
+            -keystore "$KEY_FILE" \
+            -storetype "$STORE_TYPE" \
+            -storepass "$KEY_STORE_PASS" \
+            -file cert.der
+
+          SIZE_DEC=$(stat -c%s cert.der)
+          SIZE_HEX=$(printf '0x%04x' "$SIZE_DEC")
+          HASH=$(sha256sum cert.der | awk '{print $1}')
+
+          echo "证书大小(十进制): $SIZE_DEC"
+          echo "证书大小(十六进制): $SIZE_HEX"
+          echo "证书 SHA256: $HASH"
+
+          if [ "$SIZE_HEX" = "$OFFICIAL_SIZE" ] && [ "$HASH" = "$OFFICIAL_HASH" ]; then
+            echo "CUSTOM_CERT=false" >> $GITHUB_OUTPUT
+            echo "证书与官方一致，无需额外输出签名信息"
+          else
+            echo "CUSTOM_CERT=true" >> $GITHUB_OUTPUT
+            echo "检测到自定义签名，将输出 kernel-cert-hash.txt"
+
+            mkdir -p "$GITHUB_WORKSPACE/cert-info"
+            printf 'KSU_EXPECTED_SIZE=%s\nKSU_EXPECTED_HASH=%s\n' "$SIZE_HEX" "$HASH" > "$GITHUB_WORKSPACE/cert-info/kernel-cert-hash.txt"
+            echo "证书信息已写入 cert-info/kernel-cert-hash.txt"
+          fi
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Build with Gradle
+        run: |
+          if [ "${{ inputs.PR_BUILD }}" = "true" ]; then
+            echo "PR 构建模式（-PIS_PR_BUILD=true）"
+            ./gradlew clean assembleRelease -PIS_PR_BUILD=true
+          else
+            ./gradlew clean assembleRelease
+          fi
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: manager
+          path: manager/app/build/outputs/apk/release/*.apk
+
+      - name: Upload kernel-cert-hash artifact
+        if: ${{ steps.cert.outputs.CUSTOM_CERT == 'true' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: kernel-cert-hash
+          path: cert-info/kernel-cert-hash.txt
+
+      - name: Upload mapping artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: mappings
+          path: manager/app/build/outputs/mapping/release/

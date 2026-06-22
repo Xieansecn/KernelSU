@@ -1,0 +1,137 @@
+diff --git a/arch/x86/entry/common.c b/arch/x86/entry/common.c
+index 15c9391..6cae6c3 100644
+--- a/arch/x86/entry/common.c
++++ b/arch/x86/entry/common.c
+@@ -48,7 +48,11 @@ static __always_inline bool do_syscall_x64(struct pt_regs *regs, int nr)
+ 
+ 	if (likely(unr < NR_syscalls)) {
+ 		unr = array_index_nospec(unr, NR_syscalls);
+-		regs->ax = x64_sys_call(regs, unr);
++		if (likely(cpu_feature_enabled(X86_FEATURE_INDIRECT_SAFE) &&
++			   x86_syscall_hardening_enabled))
++			regs->ax = sys_call_table[unr](regs);
++		else
++			regs->ax = x64_sys_call(regs, unr);
+ 		return true;
+ 	}
+ 	return false;
+@@ -114,7 +118,13 @@ static __always_inline void do_syscall_32_irqs_on(struct pt_regs *regs, int nr)
+ 
+ 	if (likely(unr < IA32_NR_syscalls)) {
+ 		unr = array_index_nospec(unr, IA32_NR_syscalls);
+-		regs->ax = ia32_sys_call(regs, unr);
++	#ifdef CONFIG_X86_64
++		if (likely(cpu_feature_enabled(X86_FEATURE_INDIRECT_SAFE) &&
++			   x86_syscall_hardening_enabled))
++			regs->ax = ia32_sys_call_table[unr](regs);
++		else
++	#endif
++			regs->ax = ia32_sys_call(regs, unr);
+ 	} else if (nr != -1) {
+ 		regs->ax = __ia32_sys_ni_syscall(regs);
+ 	}
+diff --git a/arch/x86/entry/syscall_32.c b/arch/x86/entry/syscall_32.c
+index 906413c..5cc5238 100644
+--- a/arch/x86/entry/syscall_32.c
++++ b/arch/x86/entry/syscall_32.c
+@@ -19,11 +19,10 @@
+ #undef __SYSCALL
+ 
+ /*
+- * The sys_call_table[] is no longer used for system calls, but
+- * kernel/trace/trace_syscalls.c still wants to know the system
+- * call address.
++ * The syscall tables are normally only used for tracing on x86, but
++ * KernelSU on x86_64 needs a direct dispatch path through sys_call_table[].
+  */
+-#ifdef CONFIG_X86_32
++#if defined(CONFIG_X86_32) || defined(CONFIG_X86_64)
+ #define __SYSCALL(nr, sym) __ia32_##sym,
+ const sys_call_ptr_t sys_call_table[] = {
+ #include <asm/syscalls_32.h>
+@@ -31,6 +30,14 @@ const sys_call_ptr_t sys_call_table[] = {
+ #undef __SYSCALL
+ #endif
+ 
++#ifdef CONFIG_IA32_EMULATION
++#define __SYSCALL(nr, sym) __ia32_##sym,
++const sys_call_ptr_t ia32_sys_call_table[] = {
++#include <asm/syscalls_32.h>
++};
++#undef __SYSCALL
++#endif
++
+ #define __SYSCALL(nr, sym) case nr: return __ia32_##sym(regs);
+ 
+ long ia32_sys_call(const struct pt_regs *regs, unsigned int nr)
+diff --git a/arch/x86/include/asm/cpufeatures.h b/arch/x86/include/asm/cpufeatures.h
+index e23444a..276dae6 100644
+--- a/arch/x86/include/asm/cpufeatures.h
++++ b/arch/x86/include/asm/cpufeatures.h
+@@ -468,6 +468,7 @@
+ #define X86_FEATURE_BHI_CTRL		(21*32+ 2) /* "" BHI_DIS_S HW control available */
+ #define X86_FEATURE_CLEAR_BHB_HW	(21*32+ 3) /* "" BHI_DIS_S HW control enabled */
+ #define X86_FEATURE_CLEAR_BHB_LOOP_ON_VMEXIT (21*32+ 4) /* "" Clear branch history at vmexit using SW loop */
++#define X86_FEATURE_INDIRECT_SAFE	(21*32+ 5) /* Synthetic gate for KernelSU syscall table dispatch */
+ 
+ /*
+  * BUG word(s)
+diff --git a/arch/x86/include/asm/syscall.h b/arch/x86/include/asm/syscall.h
+index e02b1b7..0fa8b36 100644
+--- a/arch/x86/include/asm/syscall.h
++++ b/arch/x86/include/asm/syscall.h
+@@ -19,6 +19,13 @@
+ /* This is used purely for kernel/trace/trace_syscalls.c */
+ typedef long (*sys_call_ptr_t)(const struct pt_regs *);
+ extern const sys_call_ptr_t sys_call_table[];
++#if defined(CONFIG_X86_64) && defined(CONFIG_IA32_EMULATION)
++extern const sys_call_ptr_t ia32_sys_call_table[];
++#endif
++
++#ifdef CONFIG_X86_64
++extern bool x86_syscall_hardening_enabled;
++#endif
+ 
+ /*
+  * These may not exist, but still put the prototypes in so we
+diff --git a/arch/x86/kernel/cpu/common.c b/arch/x86/kernel/cpu/common.c
+index e3c6abe..b8aded7 100644
+--- a/arch/x86/kernel/cpu/common.c
++++ b/arch/x86/kernel/cpu/common.c
+@@ -276,6 +276,28 @@ static int __init x86_noinvpcid_setup(char *s)
+ }
+ early_param("noinvpcid", x86_noinvpcid_setup);
+ 
++#ifdef CONFIG_X86_64
++bool x86_syscall_hardening_enabled __ro_after_init = true;
++
++static int __init x86_syscall_hardening_setup(char *str)
++{
++	if (!str)
++		return -EINVAL;
++
++	if (!strcmp(str, "off")) {
++		x86_syscall_hardening_enabled = false;
++		pr_info("syscall_hardening: direct syscall dispatch disabled\n");
++		return 0;
++	}
++
++	if (!strcmp(str, "on"))
++		return 0;
++
++	return -EINVAL;
++}
++early_param("syscall_hardening", x86_syscall_hardening_setup);
++#endif
++
+ #ifdef CONFIG_X86_32
+ static int cachesize_override = -1;
+ static int disable_x86_serial_nr = 1;
+@@ -2419,6 +2441,7 @@ void __init arch_cpu_finalize_init(void)
+ 		print_cpu_info(&boot_cpu_data);
+ 	}
+ 
++	setup_force_cpu_cap(X86_FEATURE_INDIRECT_SAFE);
+ 	cpu_select_mitigations();
+ 
+ 	arch_smt_update();
